@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,8 +19,8 @@ func newTestStore(t *testing.T) *SQLiteStore {
 	t.Cleanup(func() { s.Close() })
 	// Deterministic, strictly increasing clock so ordering is stable.
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	var tick int
-	s.now = func() time.Time { tick++; return base.Add(time.Duration(tick) * time.Second) }
+	var tick atomic.Int64
+	s.now = func() time.Time { return base.Add(time.Duration(tick.Add(1)) * time.Second) }
 	return s
 }
 
@@ -113,6 +115,38 @@ func TestUpdate(t *testing.T) {
 	}
 	if _, err := s.Update(ctx, 999, Patch{Completed: ptr(true)}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Update missing err = %v", err)
+	}
+}
+
+func TestConcurrentPatchesKeepEachOthersFields(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	created, _ := s.Create(ctx, "original")
+
+	// Half the patches change only the title, half only mark it completed.
+	// No patch may overwrite a field it did not send.
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p := Patch{Completed: ptr(true)}
+			if i%2 == 0 {
+				p = Patch{Title: ptr("edited")}
+			}
+			if _, err := s.Update(ctx, created.ID, p); err != nil {
+				t.Errorf("Update: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := s.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "edited" || !got.Completed {
+		t.Fatalf("lost update: %+v", got)
 	}
 }
 

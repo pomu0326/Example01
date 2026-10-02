@@ -122,24 +122,29 @@ func (s *SQLiteStore) Create(ctx context.Context, title string) (Todo, error) {
 }
 
 // Update applies the non-nil fields of p to the todo with the given ID.
+// Unset fields are left to the database (COALESCE) in a single statement, so
+// concurrent patches to different fields never overwrite each other.
 func (s *SQLiteStore) Update(ctx context.Context, id int64, p Patch) (Todo, error) {
-	t, err := s.Get(ctx, id)
-	if err != nil {
-		return Todo{}, err
-	}
+	var title *string
 	if p.Title != nil {
-		if t.Title, err = NormalizeTitle(*p.Title); err != nil {
+		t, err := NormalizeTitle(*p.Title)
+		if err != nil {
 			return Todo{}, err
 		}
+		title = &t
 	}
-	if p.Completed != nil {
-		t.Completed = *p.Completed
-	}
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE todos SET title = ?, completed = ?, updated_at = ? WHERE id = ?`,
-		t.Title, t.Completed, s.now().Format(timeLayout), id)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE todos SET title = COALESCE(?, title), completed = COALESCE(?, completed), updated_at = ? WHERE id = ?`,
+		title, p.Completed, s.now().Format(timeLayout), id)
 	if err != nil {
 		return Todo{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return Todo{}, err
+	}
+	if n == 0 {
+		return Todo{}, ErrNotFound
 	}
 	return s.Get(ctx, id)
 }
